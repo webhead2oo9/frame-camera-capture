@@ -1,0 +1,6 @@
+# Private camera captures, metadata, and traces.
+/captures/
+
+# Local build outputs.
+/tools/frametap
+/tools/unpack_raw10
