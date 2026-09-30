@@ -1,147 +1,108 @@
-# Steam Frame camera and eye-gaze access
+# Steam Frame camera capture
 
-Local investigation of this Linux ARM64 headset, with owner-authorized captures.
-Arcturus is the attached third-party color-camera module, as identified by the owner.
-This is an experimental, firmware-specific interface, not a Valve-supported API.
-Outward camera images: [`tools/frametap`](#working-method-passive-dma-buffer-capture).
-Live gaze: [`tools/eyegaze`](#working-method-public-openvr-gaze-toolseyegaze).
+Tools for reading the Steam Frame's cameras and eye tracking on the headset itself
+(Linux ARM64, SteamVR 2.18.1) while VR keeps running. Buffer layouts were worked out
+on one unit; they are not a Valve API and may break with SteamVR or firmware updates.
 
-## Working method: passive DMA-buffer capture
+| Tool | Output | Needs |
+| --- | --- | --- |
+| [`frametap`](#frametap-outward-cameras) | 6 outward cameras: Arcturus color pair (2464×2464 NV12), SLAM pair (1056×1024 gray), upper pair (640×480 gray) | `sudo`, debugfs |
+| [`eyetap`](#eyetap-eye-cameras) | 2 eye cameras, 400×400 IR, 90 fps | `sudo` |
+| [`eyegaze`](#eyegaze-gaze) | Gaze rays and head-relative yaw/pitch (CSV) | OpenVR SDK headers |
+| `unpack_raw10` | Offline MIPI RAW10 → 16-bit converter; not used by the tools above | — |
 
-`tools/frametap.c` copies existing camera buffers from the running XRService.
-It does not open `/dev/video*`, activate OpenVR camera streaming, change sensor
-registers, attach a debugger, or stop/restart any service.
+Arcturus is the attached third-party color camera module.
+
+## Build
 
 ```sh
-make
+make                                          # all tools
+make tools/frametap tools/eyetap tools/unpack_raw10   # without the OpenVR SDK
+```
+
+Requires C and C++17 compilers, Linux UAPI headers, and make. `eyegaze` needs the OpenVR
+SDK headers in `../openvr` and links the installed runtime loader
+(`/opt/steamvr/bin/linuxarm64/libopenvr_api.so`) via rpath; override with
+`make OPENVR_SDK=... STEAMVR_LIBDIR=...`. FFmpeg is only used for previews.
+
+## Common behavior
+
+- `frametap` and `eyetap` need `sudo` to duplicate buffer handles from another process
+  (`pidfd_getfd`; handle duplication, not a ptrace attach). After that they drop to the
+  sudo caller's UID/GID; a direct root login keeps root and warns.
+- Output goes to a new 0700 directory (default under `captures/`); files are 0600. The
+  output directory must not exist. `.part` files are incomplete; each frame's JSON
+  record is written last and marks it complete.
+- No tool opens a camera device, writes shared memory, takes locks, or starts/stops
+  services.
+- `captures/` and compiled binaries are Git-ignored. Captures can contain room
+  contents, screens, faces, serial numbers, and calibration data.
+
+## frametap: outward cameras
+
+```sh
 sudo ./tools/frametap --list
 sudo ./tools/frametap --count 2
-```
-
-Keep the headset awake and passthrough active. The tool does not wake it.
-Default output: a new `captures/tap-YYYYmmdd-HHMMSS-PID/` directory. Other options:
-
-```sh
-# Parent directory must exist; the output directory must NOT already exist.
 sudo ./tools/frametap --camera arcturus-a --count 4 --output captures/my-capture
-sudo ./tools/frametap --camera upper-b --count 8
 sudo ./tools/frametap --count 2 --full --output captures/my-full-capture
-# Optional: select a particular running XRService when more than one exists.
-sudo ./tools/frametap --pid PID --list
+sudo ./tools/frametap --pid PID --list        # when several XRService processes exist
 ```
 
-Camera selectors: `all`, `arcturus-a`, `arcturus-b`, `slam-a`, `slam-b`,
-`upper-a`, `upper-b`. `all` selects available supported pairs; absent pairs are
-reported. Partial or unexpected ring layouts are rejected, not guessed.
+Cameras: `all` (default), `arcturus-a`, `arcturus-b`, `slam-a`, `slam-b`, `upper-a`,
+`upper-b`. The headset must be awake with passthrough active. After 5 s without new
+frames the tool exits instead of saving stale ones.
 
-Prerequisites:
+### Output
 
-- Linux with `pidfd_open`, `pidfd_getfd`, udmabuf, DMA-buffer sync, and an already
-  mounted debugfs exposing `/sys/kernel/debug/dma_buf/bufinfo`.
-- Running XRService with its normal sensor configuration and advancing frames.
-- Root access via `sudo`, for debugfs and the ptrace permission check on
-  `pidfd_getfd`. This is handle duplication, not a ptrace attach. No Yama setting
-  or persistent executable capability is changed. CAP_SYS_PTRACE alone would
-  not necessarily grant debugfs access.
-- A C compiler, Linux UAPI headers, and make. FFmpeg is only needed for previews.
-  Plain `make` also builds `tools/eyegaze`, which needs the OpenVR SDK headers in
-  `../openvr`; use `make tools/frametap tools/unpack_raw10` without them.
-
-After discovery and descriptor duplication, the program drops supplementary
-groups and root UID/GID to the sudo caller before creating output. Captures are
-0600, new capture directories 0700. A direct root invocation without sudo identity
-keeps root privileges and warns. Images and original traces can contain private
-room contents, screens, serials, and calibration data; do not publish them blindly.
-
-`captures/` and the compiled `tools/frametap`, `tools/unpack_raw10`, and
-`tools/eyegaze` binaries are Git-ignored. Capture links below refer to local
-investigation artifacts, not files distributed with the repository. Keep custom
-output paths under `captures/` to retain that protection; ignoring files does not
-remove already tracked content.
-
-### Output and decoding
-
-Each successful frame has an image and a JSON completion record with format,
-geometry, stride, source PID/fds/inodes, allocation sizes, the first metadata
-uint64, and the host-monotonic copy interval. The metadata uint64 is stored as a
-string to avoid losing precision in JSON consumers. Its units remain unknown.
-
-| Camera kind | Active image | File | Native stride | Image allocation | Metadata allocation |
+| Camera | Image | File | Stride | Image buffer | Metadata buffer |
 | --- | --- | --- | ---: | ---: | ---: |
-| Arcturus | 2464 × 2464 color | `.nv12` | 3328 | 12,353,536 B | 1,064,960 B |
-| SLAM | 1056 × 1024 mono | `.pgm` | 1056 | 1,769,472 B | 151,552 B |
-| Upper tracking | 640 × 480 mono | `.pgm` | 640 | 462,848 B | 8,192 B |
+| Arcturus | 2464×2464 color | `.nv12` | 3328 | 12,353,536 B | 1,064,960 B |
+| SLAM | 1056×1024 mono | `.pgm` | 1056 | 1,769,472 B | 151,552 B |
+| Upper | 640×480 mono | `.pgm` | 640 | 462,848 B | 8,192 B |
 
-Arcturus files retain native row padding: Y occupies 3328 × 2464 bytes, followed
-by interleaved UV with the same stride and 1232 rows. UV starts at byte 8,200,192;
-the saved NV12 payload is 12,300,288 bytes. Decode at the padded width, then crop:
+Arcturus files keep the row padding: Y is 3328×2464, then interleaved UV (same stride,
+1232 rows) at byte 8,200,192; 12,300,288 bytes total. Decode at the padded width and crop:
 
 ```sh
-ffmpeg -f rawvideo -pixel_format nv12 -video_size 3328x2464 \
-  -i captures/my-capture/arcturus-a-000001.nv12 \
-  -vf 'crop=2464:2464:0:0' -frames:v 1 captures/my-capture/arcturus-a-000001.png
-
-ffmpeg -i captures/my-capture/slam-a-000001.pgm \
-  -frames:v 1 captures/my-capture/slam-a-000001.png
+ffmpeg -f rawvideo -pixel_format nv12 -video_size 3328x2464 -i arcturus-a-000001.nv12 \
+  -vf 'crop=2464:2464:0:0' -frames:v 1 arcturus-a-000001.png
+ffmpeg -i slam-a-000001.pgm -frames:v 1 slam-a-000001.png
 ```
 
-These commands illustrate filenames; select a directory containing that camera.
-The mono PGM payloads are exactly 1,081,344 and 307,200 bytes, respectively,
-plus their PGM headers. No normalization, undistortion, rotation, or exposure
-filtering is applied. Color-range/matrix interpretation has not been calibrated;
-FFmpeg's preview is not a colorimetric reference.
+Images are unprocessed: no normalization, undistortion, or rotation; color matrix and
+range are uncalibrated. Each JSON record holds geometry, stride, source PID/fds/inodes,
+buffer sizes, the first metadata u64 (as a string; units unknown), and the host copy
+time. `--full` also saves the whole image and metadata buffers (`.image.bin`,
+`.metadata.bin`), including undecoded tails.
 
-`--full` additionally saves `.image.bin` and `.metadata.bin` containing the whole
-two allocations, including padding and unknown tails. Extra mono-buffer data is
-not decoded; calling it an ICP output or UV plane would be an inference.
-`.part` files are incomplete. A matching published JSON file is the completion
-record; interrupted/error runs may leave partial files or already completed frames.
+Tracking cameras alternate scene exposures with short controller-LED exposures, so some
+valid frames are nearly black. Capture several frames to get a scene view.
 
-Tracking streams include scene-exposure and short controller-exposure images.
-Some perfectly readable frames therefore look nearly black. The tool does not
-decode exposure classes or discard dark frames. Capture several frames when you
-need a scene view rather than a controller-LED exposure.
+### How it works
 
-### Discovery, pairing, and consistency limits
+1. Find the single `XRService` process (or `--pid`) and pin it with `pidfd_open`.
+2. From `/sys/kernel/debug/dma_buf/bufinfo`, take known-size `udmabuf` objects attached
+   to `acb8000.isp`; match their inodes in XRService's `/proc/PID/fdinfo`. Size alone is
+   not enough; display buffers share sizes.
+3. Require 32 image and 32 metadata buffers per camera kind (two 16-slot rings), sorted
+   by inode with image/metadata alternating; split into blocks `a` and `b`.
+4. Duplicate with `pidfd_getfd`, re-check inode and size, map `PROT_READ`, and bracket
+   reads with `DMA_BUF_IOCTL_SYNC(READ)`.
+5. Per camera, pick the slot with the second-largest metadata value (the newest may
+   still be written), copy it, and discard the copy if the value changed.
 
-1. Locate exactly one process whose executable basename is `XRService`, or check
-   the explicit PID. Pin it with `pidfd_open` and detect process exit.
-2. Parse DMA debugfs for known-size `udmabuf` objects attached to `acb8000.isp`.
-   Cross-reference their inodes against XRService's `/proc/PID/fdinfo`. Size alone
-   is insufficient: other display/processing buffers share sizes.
-3. Expect 32 distinct images and 32 metadata buffers per available kind: two
-   16-slot rings. Sort by inode, not reusable fd number. Require image/metadata
-   allocations to alternate, and split each kind into two blocks of 16.
-4. Duplicate only selected handles using `pidfd_getfd`; recheck exporter, inode,
-   and size on the duplicates. Map with `PROT_READ`. Bracket reads with
-   `DMA_BUF_IOCTL_SYNC(START|READ)` and `END|READ`.
-5. Sample the first little-endian metadata uint64. Skip the largest observed
-   value and select the second-largest distinct value. Require advancement beyond
-   startup and beyond the preceding saved frame; recheck the selected marker
-   before and after copying. Discard a copy when that marker changes.
-6. Fail after five seconds without an advancing, stable candidate. Standby
-   buffers are not silently presented as new frames. A stopped XRService also
-   aborts the run. Restart/hotplug requires fresh discovery.
+### Limits
 
-**These are heuristics, not a completed-buffer ownership protocol.** Inode order
-matched the observed allocations, but is not a stable kernel/firmware camera ABI.
-The archived strace abbreviates QBUF's plane descriptors, so it does not directly
-prove image/metadata association. The alternating-order check rejects some changes,
-not every possible wrong association.
-
-DMA-buffer sync provides CPU cache coherency, not a producer fence or exclusion
-against ISP/ICP writers. Second-newest selection plus a marker recheck reduces
-races but cannot prove a coherent exposure or detect every torn frame. Copies of
-different cameras are sequential, not synchronized stereo acquisitions. No
-sub-microsecond timing claim, exact frame-rate claim, or conversion to nanoseconds
-is established for the opaque metadata value. Host copy times are not exposure
-times. Sustained-rate performance and VR latency impact have not been benchmarked.
+- Image/metadata pairing is inferred from allocation order; it is not a stable ABI.
+- DMA sync gives cache coherency, not a producer fence. Torn frames are reduced, not
+  ruled out. Cameras are copied one after another, not as synchronized stereo pairs.
+- Metadata units, frame timing, and VR latency impact are not measured.
 
 ### Camera identity
 
-Media topology and XRService logs identify these sensor routes on this device:
+From the media topology and XRService logs:
 
-| XRService name | Sensor | Sensor subdevice | Capture node |
+| XRService name | Sensor | Subdevice | Video node |
 | --- | --- | --- | --- |
 | passthrough_left | arcimx616, I2C 0-001a | `/dev/v4l-subdev29` | `/dev/video0` |
 | passthrough_right | arcimx616, I2C 0-0010 | `/dev/v4l-subdev28` | `/dev/video3` |
@@ -150,285 +111,203 @@ Media topology and XRService logs identify these sensor routes on this device:
 | upper_left | og0ve10 | `/dev/v4l-subdev32` | `/dev/video6` |
 | upper_right | og0ve10 | `/dev/v4l-subdev33` | `/dev/video7` |
 
-The recorded setup order was video9, video13, video6, video7, video3, video0.
-**[INFERENCE]** allocation block `a` is consequently right for Arcturus/SLAM and
-left for upper tracking; block `b` is the opposite. The tool intentionally uses
-`a`/`b`, not anatomical labels. A covered-lens experiment would be needed to
-independently confirm each association. Neither mapping nor buffer sizes should
-be assumed to survive a firmware update or different startup/hotplug ordering.
+XRService set the nodes up in the order video9, video13, video6, video7, video3, video0,
+so block `a` is probably right for Arcturus/SLAM and left for upper (inferred; not
+confirmed with a covered lens).
 
-The pad format `Y10_1X10` on arcimx616 does not mean the accessible DMA allocation
-contains RAW10. XRService configured NV12, and the captured buffers decode as
-color NV12. This establishes processed color access before application rendering,
-not sensor Bayer access. Whether another live pipeline exposes Bayer data is
-unresolved. Stopping VR alone did NOT yield a verified Bayer capture.
+The Arcturus sensor pad reports `Y10_1X10`, but XRService configures NV12 and the
+buffers decode as processed color. Sensor Bayer data is not reachable this way.
 
-## Verification and retained captures
-
-- `make` compiled `frametap` with `-Wall -Wextra -Wpedantic` without diagnostics.
-- `--list` enumerated 96 image/metadata pairs across all six cameras.
-- A standby capture exited with a five-second no-advancement error, saving no stale
-  image. XRService logged user absence and paused tracking cameras.
-- After the owner woke the headset, `--count 2 --full` saved 12 frames under
-  [`captures/passive-live/`](captures/passive-live/). Every camera had advancing
-  markers and different pixel hashes between its two frames. Image sizes matched
-  the layouts above, normal payloads matched full-buffer prefixes, and output
-  ownership/modes were UID 1000 / 0600.
-- All six scene views decoded and were visually inspected. The
-  [scene contact sheet](captures/passive-live/scene-contact-sheet.png) has Arcturus
-  in row 1, SLAM in row 2, upper in row 3; `a` left, `b` right. It uses Arcturus
-  frame 2 and mono frame 1, without brightening. These are not simultaneous frames.
-- An explicit-PID, single-camera `upper-b --count 8` capture also succeeded,
-  exercising default output naming and capture without `--full`.
-- Invalid counts, unknown selectors, and a non-XRService PID were rejected.
-- Reusing an existing output directory was rejected, and its original capture
-  hash stayed unchanged. All eight single-camera completion records had advancing
-  markers and correctly sized mono payloads.
-- The observed VR process PIDs remained vrserver 13509, XRService 13623,
-  vrcompositor 13629 across passive capture. No service-control commands were
-  issued for the passive tests. This is not a headset-render latency measurement.
-
-These captures were made during the 2026-09-29 investigation. Original processed
-snapshot images are separately retained in
-[`captures/2026-09-29_xrservice-snapshot/`](captures/2026-09-29_xrservice-snapshot/).
-
-## Other methods investigated
-
-### OpenVR public tracked camera: unsuccessful here
-
-A background OpenVR client queried `IVRTrackedCamera_006`. `HasCamera` returned
-present, but `GetCameraFrameSize` failed for all three frame types, including after
-`AcquireVideoStreamingService`. Acquisition success did not imply usable frames.
-
-Releasing the service/shutting down the probe coincided with compositor logging
-`Depth mesh block queues disconnected successfully`; the owner reported losing
-the VR camera view. Exact causality was not proved. The owner restored it via
-**Menu → camera off → camera on**. Do not repeat acquire/release probes during use.
-The unsupported probe is not part of the delivered tool.
-
-### SteamVR virtual camera: not physical-camera access
-
-`/dev/video99` is a `v4l2loopback` device labelled SteamVR, reported as 1920×1080
-RGB24 at 30 fps. FFmpeg captured a black frame. Installed `v4l2cam` strings refer
-to mirroring an overlay; this is not evidence of a sensor-frame export route.
-
-### XRService snapshot: working, but requires exclusive camera ownership
-
-With the normal runtime held down and camera ownership released, this invocation
-completed in about 11 seconds during the earlier experiment:
+## eyetap: eye cameras
 
 ```sh
-# Historical exclusive-mode command, NOT safe alongside the running XRService.
-# Run from /opt/steamvr/drivers/cv/bin/linuxarm64 with its normal library setup.
-./XRService --documentsRoot /tmp/xrsnap-docs --snapshotCamerasAndExit --showLogToConsole
+sudo ./tools/eyetap --list                   # ring slots and timestamps
+sudo ./tools/eyetap --count 90               # 1 s of consecutive frames per eye
+sudo ./tools/eyetap --eye a --count 30 --output captures/right-eye
 ```
 
-It produced RGB PNGs for both Arcturus cameras, grayscale PNGs for all four
-tracking cameras plus their controller-exposure variants, `cameraMetadata.json`,
-and `logs.tar.gz`. This is processed imagery, not Bayer RAW10. The original
-snapshot metadata contains exposure/gain and sensor identifiers.
+Camera `a` is the right eye, `b` the left (verified; filenames keep `a`/`b` because
+the mapping comes from ring order). The headset must be worn: eye tracking stops
+off-head, and the tool exits after 3 s without new frames.
 
-The earlier experiment used a temporary `systemctl --user mask --runtime
-steamvr.service` to prevent competing restarts; this also interrupts the VR session.
-The mask was removed, SteamVR/gamescope restored, and the owner confirmed VR was
-back. Recovery commands used in that investigation were:
+Each frame is `eye-{a,b}-NNNNNN.pgm` (400×400 8-bit IR, sensor orientation, unprocessed)
+plus a JSON record with slot, frame timestamp, host copy time, buffer inode, and
+ring-header values. Every new frame is saved once, in order. Camera `b` images appear
+rotated/flipped relative to `a`.
+
+### Where the frames are
+
+The eye cameras run through the ADSP (`CStereoAdspCams`); no eye-camera V4L2 node is
+used. Frames land in a 16 MiB `udmabuf` held by the `eyetracking` process and also mapped
+by `dsp_service`, vrserver, XRService, and vrcompositor.
+
+| Item | Value |
+| --- | --- |
+| Ring | 8 slots from `0x234000`, pitch `0x40000`; slots 0–3 camera `a`, 4–7 camera `b` |
+| Image start, slot k | `0x234000 + k·0x40000 + 256 + 64·k`, plus 64 for `k ≥ 4` |
+| Image | 400×400 bytes, row stride 512 |
+| Timestamp | u64 LE nanoseconds at image start − 64 |
+| Ring header (at `0x234000`) | per camera, 16 bytes apart: exposure (s), gain, frame rate (inferred) |
+
+The image start was derived two ways (padding position and last non-zero byte) and they
+agree. Timestamps are 11.11 ms apart (90 fps) and run ~0.48 s ahead of host
+`CLOCK_MONOTONIC`; their clock is unknown. The two cameras' frames are 33–82 µs apart.
+
+### How it works
+
+Find the `eyetracking` process, require exactly one 16 MiB udmabuf, duplicate it with
+`pidfd_getfd`, and map it `PROT_READ`. Per camera, take the second-newest timestamp,
+copy the 400 rows, and discard the copy if the timestamp changed. Unlike `frametap`,
+there is no `DMA_BUF_IOCTL_SYNC`: CPU processes also write this buffer, and a cache
+operation on it is not known to be side-effect free. The tool refuses to run if the
+buffer or timestamps don't match the expected layout.
+
+### Limits
+
+- Offsets are hard-coded from observation.
+- No producer fence: a rewrite that keeps the same timestamp would go undetected
+  (`tear_free_guaranteed` is `false`).
+- Other ring-header fields and the timestamp clock are undecoded.
+
+## eyegaze: gaze
 
 ```sh
-systemctl --user unmask --runtime steamvr.service
-systemctl --user start gamescope-session.target steamvr.service steamvr-v4l2cam.service
+./tools/eyegaze --seconds 20 --output captures/gaze/run.csv   # no sudo
+./tools/eyegaze --seconds 5 --interval-ms 20                   # CSV on stdout
 ```
 
-They are recorded for incident recovery, not part of passive capture. Do not kill
-XRService alone: driver_cv can restart it. Do not run another capture owner until
-`fuser` confirms the relevant devices are free, and account for automatic restarts.
+Needs SteamVR, the normal `eyetracking` service, and the headset worn. Runs as the
+desktop user (refuses root). Exit codes: 0 usable gaze, 2 no usable gaze (e.g. off-head),
+1 error.
 
-### Direct V4L2 RAW10/GREY capture: failed experiment
+### How it works
 
-Stopping `steamvr.service` without preventing automatic restart raced against
-XRService. The direct experiment set Arcturus to 2464×2464 `Y10P` with stride
-3088 and SLAM to 1056×1024 `GREY`, using `v4l2-ctl` streaming. It obtained bytes
-from Arcturus and SLAM, but rendered images were structured noise, not valid scene
-captures. Upper-camera attempts failed with EPIPE/timeout. XRService restarted
-while a camera was still held, encountered busy devices, and the owner reported
-fallback to 3DoF. The later restored runtime recovered normal operation.
-
-`tools/unpack_raw10.c` is the retained offline MIPI RAW10 unpacker: each group of
-four pixels uses four high-byte values and a fifth byte holding two low bits per
-pixel. Its default little-endian 16-bit output is left-shifted by six; `--no-shift`
-retains values 0–1023. Correct unpacking did not repair the misconfigured capture.
-It is **not** the decoder for the working NV12 tap.
-Dimensions must be positive decimal integers; the unpacker rejects malformed or
-overflowing geometry before opening files. Input and output must be different
-files, including when reached through hard links or symlinks. An existing,
-distinct output file is overwritten.
-
-A successful standalone snapshot was traced with `strace -f -tt -v -s 200` over
-`openat,ioctl,write,pwrite64,execve`. Evidence is retained in
-[`captures/bringup-trace/`](captures/bringup-trace/): raw trace, console output, and
-a decoded operation sequence. The trace showed `VIDIOC_S_CTRL` on arcimx616 using
-`V4L2_CID_BRIGHTNESS` as a register-write transport:
-
-- Register address: `value & 0xffff`.
-- Register byte: `(value >> 16) & 0xff`.
-- Writes included sensor timing, crop/binning, and stream-on register `0x0100`.
-- SPI, media topology, DSP/ICP and other initialization were also involved.
-
-Thus setting a video-node format alone did not reproduce XRService's configured
-pipeline. Blindly replaying register writes is not a supported access method.
-Existing CSID2 errors were observed before the failed experiment as well; those
-messages alone do not establish its cause. Compression/DSC in Arcturus was a
-hypothesis, not a demonstrated explanation for the failed capture.
-
-### Dataset recording and private camera configuration: leads, not verified exports
-
-Installed dashboard code exposes Room and Tracking recording via
-`VRHTML.VRSystem.StartTrackingRecording` / `StopTrackingRecording`; driver strings
-include `start_tracking_recording` / `stop_tracking_recording`. The current settings
-had `allowTrackingCameraRecording`, `allowTrackingScreenRecording`, and
-`allowTrackingAudioRecording` enabled. This can involve screen/audio, not only
-cameras; privacy scope matters. No OCC dataset export or decoder was tested here.
-XRService help advertised recording codecs `h264`, `h265`, `jpeg`, and OCC tooling
-symbols were present. This is not proof that an OCC file contains lossless Bayer.
-`vrcmd --startcapture/--stopcapture` refers to an SVL network capture, not this route.
-A working command-line camera-recording sequence has not been established.
-
-The owner's linked [frame-passthrough-shortcuts project](https://github.com/KominoVR/frame-passthrough-shortcuts)
-uses `IVRCameraPassthroughInternal_001` slots 9/10 to read/write a five-byte camera
-configuration, preserving unrelated options. Its
-[source](https://github.com/KominoVR/frame-passthrough-shortcuts/blob/main/src/openvr_camera_source.cpp)
-is a source-selection lead, not a pixel-buffer API. It was inspected, not executed.
-Private `XRPCClient` exports in `libArcturusPerception.so` were also investigated;
-no safe second-client frame-export protocol was established.
-
-Directly reopening another process's DMA-buf through `/proc/PID/fd/N` failed
-(ENXIO/EACCES). `pidfd_getfd` with authorized privilege succeeded instead; that is
-the mechanism used by `frametap`, not reading arbitrary process memory.
-
-## Eye tracking
-
-Eye-tracking access is separate from the six outward-facing cameras.
-
-### Working method: public OpenVR gaze (`tools/eyegaze`)
-
-```sh
-make tools/eyegaze
-./tools/eyegaze --seconds 20 --output captures/gaze/my-run.csv   # no sudo
-./tools/eyegaze --seconds 5 --interval-ms 20                      # CSV on stdout
-```
-
-Prerequisites: SteamVR running, headset worn and awake, the eye-tracking service
-running normally (`/opt/steamvr/tools/eyetracking/bin/linuxarm64/eyetracking`), the
-local SDK headers in `../openvr` (2.15.6, `IVRInput_011`), and a C++17 compiler.
-Run as the desktop user; the tool refuses root. The output CSV must not exist.
-Exit codes: 0 = usable gaze observed, 2 = connected but no usable gaze (e.g.
-standby/off-head), 1 = API, I/O, or argument error.
-
-The Makefile links against the **installed** runtime loader,
-`/opt/steamvr/bin/linuxarm64/libopenvr_api.so`, via rpath. The SDK tree's own ARM64
-loader failed with `Unable to read VR Path Registry from /data/work/openvrpaths.vrpath`.
-Override with `make OPENVR_SDK=... STEAMVR_LIBDIR=...`.
-
-How it works:
-
-- `VR_Init(VRApplication_Background)`; checks `Prop_SupportsXrEyeGazeInteraction_Bool`
-  on the HMD (reported `1` here).
-- Sets the action manifest [`tools/eyegaze_actions.json`](tools/eyegaze_actions.json):
-  action `/actions/gaze/in/eye_gaze`, type `eyetracking` in set `/actions/gaze`.
-  Valve's [Steam Frame input doc](https://partner.steamgames.com/doc/steamhardware/steamframe/input)
-  specifies the action type; it does not document the binding.
-- Default binding [`tools/eyegaze_bindings_frame_hmd.json`](tools/eyegaze_bindings_frame_hmd.json)
-  for controller type `frame_hmd`:
+- Connects as an OpenVR background app and checks `Prop_SupportsXrEyeGazeInteraction_Bool`.
+- Action manifest [`tools/eyegaze_actions.json`](tools/eyegaze_actions.json) declares
+  `/actions/gaze/in/eye_gaze` of type `eyetracking` (per Valve's
+  [Steam Frame input doc](https://partner.steamgames.com/doc/steamhardware/steamframe/input)).
+- Binding [`tools/eyegaze_bindings_frame_hmd.json`](tools/eyegaze_bindings_frame_hmd.json)
+  maps it for `frame_hmd`:
   `"eyetracking": [{"output": "/actions/gaze/in/eye_gaze", "path": "/user/head/eyetracking"}]`.
-  The section name and required `path`/`output` fields come from vrserver/vrclient
-  validation strings (`"eyetracking" member must be an array`, `... missing path or
-  output`). The path was inferred from the driver component name `/eyetracking` and is
-  confirmed by the live data below. Without this file SteamVR logged `frame_hmd has no
-  configured binding. Input will not be available`, and every sample was inactive.
-  Both JSON files must stay beside the executable. A harmless `frame_controller has
-  no configured binding` error remains because the tool defines no controller actions.
-- Each poll calls `UpdateActionState`, `GetEyeTrackingDataRelativeToNow(standing, 0 s)`,
-  and `GetDeviceToAbsoluteTrackingPose` for the HMD. `ForNextFrame` is not used: it
-  depends on the compositor's `WaitGetPoses`, which a background tool must not call.
+  Valve doesn't document this; the format came from vrserver validation strings and the
+  path from the driver's `/eyetracking` component. Without it SteamVR reports "no
+  configured binding" and all samples are inactive. Keep both JSON files beside the binary.
+- Each poll calls `UpdateActionState`, `GetEyeTrackingDataRelativeToNow` (standing
+  universe, 0 s), and the HMD pose. `ForNextFrame` needs `WaitGetPoses`, which a
+  background app must not call.
 
 CSV columns: `host_monotonic_ns, input_error, active, valid, tracked, usable,
-hmd_activity, head_pose_valid`, then standing-space `origin_*_m` and `target_*_m`,
-then head-frame unit direction `head_dir_x/y/z` and `head_yaw_deg`/`head_pitch_deg`.
-Head frame: +x right, +y up, −z forward; yaw positive right, pitch positive up.
-Ray fields are blank for unusable samples, never zero-filled. Head-frame fields are
-also blank when the HMD pose is not `Running_OK`.
+hmd_activity, head_pose_valid, origin_{x,y,z}_m, target_{x,y,z}_m, head_dir_{x,y,z},
+head_yaw_deg, head_pitch_deg`. Head frame: +x right, +y up, −z forward; yaw positive
+right, pitch positive up. Unusable samples leave the ray fields blank.
 
-Interpretation limits:
+### Limits
 
-- `target` is a fixation point, not a unit direction. Ray length ranged 0.11–59.9 m in
-  one run. Use the direction `normalize(target − origin)` or the `head_*` columns.
-  **[INFERENCE]** Depth is a vergence estimate; it was not validated as a distance.
-- Polling every 10 ms returned a different value on 1,999 of 2,000 polls. That reflects
-  the API evaluating/predicting at call time **[INFERENCE]**, not a 100 Hz tracker.
-  `vrserver.txt` logs `Request eye tracking framerate: 90`, and HMD settings list
-  `eyeTrackingRateMin/Max` 15/90. The true estimator rate was not measured.
-- The straight-ahead baseline sat about 3–8° left and 8–17° down. Whether that is the
-  subject's natural gaze or a calibration offset was not determined; no ground-truth
-  targets were used. Accuracy in degrees is therefore unmeasured.
-- Each row pairs gaze and head pose from two separate API calls at nearly the same
-  time, not an atomically matched sample.
+- `target` is a fixation point (ray lengths 0.11–59.9 m); use the direction, not the
+  depth.
+- Values change on every poll because the API evaluates at call time (inferred). The
+  service requests 90 fps and the eye cameras run at 90 fps; the gaze estimator's own
+  rate is unmeasured.
+- Accuracy is unmeasured (no ground-truth targets). Straight-ahead read 3–8° left and
+  8–17° down.
+- Gaze and head pose come from two API calls, not one atomic sample.
 
-The tool is an ordinary OpenVR input client: it does not touch the eye-tracking
-service, its shared memory, DSP buffers, or eye cameras, and it changes no settings
-or other applications' bindings.
+## Verification (2026-09-29, this unit)
 
-### Verification
+**frametap**
+- `--list` found 96 image/metadata pairs across six cameras.
+- In standby, capture exited after 5 s without saving.
+- `--count 2 --full` saved 12 frames ([`captures/passive-live/`](captures/passive-live/));
+  each camera's frames advanced and differed, sizes matched the table, and all six views
+  decoded ([contact sheet](captures/passive-live/scene-contact-sheet.png): Arcturus, SLAM,
+  upper rows; `a` left, `b` right; not simultaneous).
+- `upper-b --count 8` with default naming worked; invalid counts, selectors, PIDs, and an
+  existing output directory were rejected with the old capture unchanged.
+- vrserver, XRService, and vrcompositor kept their PIDs throughout.
 
-- Standby: support property `1`, binding loaded, all samples inactive, exit 2.
-- First worn run, 20 s at 10 ms: 2,000/2,000 samples active, valid, and tracked.
-  That version recorded standing-space rays only; head motion and eye motion were
-  indistinguishable, so it was superseded rather than retained.
-- Head-relative directed sweep, 25 s at 10 ms:
-  [`captures/gaze/head-relative-sweep.csv`](captures/gaze/head-relative-sweep.csv).
-  2,500/2,500 samples usable; gaze-origin spread under 6 mm on every axis (head still).
-  The owner was asked to look straight, left, right, up, down; half-second medians:
+**eyetap**
+- Live runs before and after the code cleanup: [`captures/eyes-live/`](captures/eyes-live/)
+  (`--count 30`) and [`captures/eyes-retest/`](captures/eyes-retest/) (`--count 90`). Every
+  frame complete (400×400, 0600, no `.part` files), all distinct, gaps 11.08–11.13 ms
+  (no drops), camera pairs 33–82 µs apart. The retest caught a blink
+  ([contact sheet](captures/eyes-retest/contact-sheet.png)).
+- Left eye closed ([`captures/eyes-left-closed/`](captures/eyes-left-closed/)): camera
+  `b` showed a closed lid in every sampled frame, camera `a` an open eye.
+- Headset off: `--list` read the ring; capture exited after 3 s without saving.
+- Passthrough pauses logged during this work matched playspace setting changes
+  (`SessionSettingsChanged`), not the tool.
 
-  | Instruction | Time | Yaw | Pitch |
+**eyegaze**
+- Standby: binding loaded, all samples inactive, exit 2.
+- Directed sweep, 25 s at 10 ms ([`captures/gaze/head-relative-sweep.csv`](captures/gaze/head-relative-sweep.csv)):
+  2,500/2,500 samples usable, head still (origin moved < 6 mm).
+
+  | Look | Time | Yaw | Pitch |
   | --- | --- | ---: | ---: |
   | Straight | 0–4 s | −3° to −8° | −8° to −17° |
   | Left | 4.5–9 s | −31.5° | −9.5° |
   | Right | 10.5–17.5 s | +31° | −2° |
   | Up | 18–23.5 s | −0.5° | +28° |
-  | Down | 24.5 s (recording ended) | +6° | −37° |
+  | Down | 24.5 s (end) | +6° | −37° |
 
-  Stable, distinct clusters in the instructed order confirm the binding path, sign
-  conventions, and that the data follows eye movement. VR processes kept running.
+## What didn't work
 
-### Other eye-tracking routes investigated, not used
+- **OpenVR `IVRTrackedCamera_006`**: `HasCamera` true, but `GetCameraFrameSize` failed
+  for all frame types, even after `AcquireVideoStreamingService`. Releasing the service
+  coincided with passthrough dropping; **Menu → camera off → on** restored it. Don't run
+  acquire/release probes during use.
+- **`/dev/video99`**: a SteamVR `v4l2loopback` device (1920×1080 RGB24); it returned a
+  black frame.
+- **XRService snapshot** (`--snapshotCamerasAndExit`): produces processed PNGs of all six
+  cameras plus controller exposures and exposure/gain metadata
+  ([`captures/2026-09-29_xrservice-snapshot/`](captures/2026-09-29_xrservice-snapshot/)),
+  but needs exclusive camera access, i.e. VR stopped:
 
-- `/dev/shm/eye-server.mmap` (320 KiB mapping): created by the eyetracking server
-  (`CEyeTrackingMmapServer`), mapped only by vrserver's `driver_cv.so`
-  (`CEyeTrackingMmapClient`). It uses robust process-shared mutexes and futex wake-ups
-  for server→client and client→server channels; layout, magic, and version were not
-  recoverable from strings. Taking those locks from a third process could stall the
-  tracker. **[INFERENCE]** Its size fits two 400×400 8-bit eye images plus a 4 KiB
-  header (`/persist/eyetracking.json` lists 400×400 eye-camera intrinsics); contents
-  were deliberately not read.
-- Eye-camera images: the eyetracking binary has a `--calib <seconds>` mode that saves
-  `left_N.png`/`right_N.png` and `meta.json` under `/tmp/etcalib_*`, but it opens the
-  cameras itself and would conflict with the running server. Not tested.
-- `--logGazes` (via the `eyeDataRecordToDisk` setting and `start_eyetracking.sh start
-  datacapture`) writes gaze-only logs; it requires a service restart. Not tested.
-- DSP-side DMA buffers in the eyetracking and vrserver processes use frame-ownership
-  semantics; an extra reader could take frames from the tracker. Not attempted.
-- `IVRSystem::GetEyeTrackedFoveationCenter` returns per-eye NDC points for foveated
-  rendering, not a gaze ray. Not exercised.
-- Historical logs mention `CGazeEstimatorCdsp` input-buffer misses, legacy
-  OVM6211/ADSP camera paths, and an `exp5v rail ... rework is required` shutdown
-  warning. None prevented the live gaze results above.
+  ```sh
+  # Stops VR. Run from /opt/steamvr/drivers/cv/bin/linuxarm64.
+  systemctl --user mask --runtime steamvr.service && systemctl --user stop steamvr.service
+  ./XRService --documentsRoot /tmp/xrsnap-docs --snapshotCamerasAndExit --showLogToConsole
+  # Restore:
+  systemctl --user unmask --runtime steamvr.service
+  systemctl --user start gamescope-session.target steamvr.service steamvr-v4l2cam.service
+  ```
 
-No eye-camera frames were captured.
+  Without the mask, SteamVR restarts and races for the cameras. Don't kill XRService
+  alone; `driver_cv` restarts it.
+- **Direct V4L2 capture** (Arcturus `Y10P` stride 3088, SLAM `GREY`, via `v4l2-ctl`
+  with SteamVR stopped): returned structured noise; upper cameras failed with
+  EPIPE/timeout. XRService restarted mid-test and tracking fell back to 3DoF. An strace
+  of the working snapshot ([`captures/bringup-trace/`](captures/bringup-trace/)) shows why:
+  XRService programs the arcimx616 through `VIDIOC_S_CTRL(V4L2_CID_BRIGHTNESS)` used as a
+  register write (address `value & 0xffff`, data `(value >> 16) & 0xff`: timing,
+  crop/binning, stream-on `0x0100`), plus SPI, media-graph, and DSP/ICP setup. A
+  plain format change doesn't reproduce that.
+- **`unpack_raw10`** is left from that attempt. It unpacks RAW10 (4 pixels in 5 bytes)
+  to 16-bit LE, shifted left 6 (`--no-shift` keeps 0–1023). It rejects malformed or
+  overflowing geometry before opening files and requires distinct input and output
+  files (including via links); an existing output file is overwritten.
+- **Reopening another process's DMA-buf via `/proc/PID/fd/N`**: ENXIO/EACCES.
+  `pidfd_getfd` works.
+- **Not pursued**: tracking/dataset recording (`StartTrackingRecording`; may include
+  screen and audio; OCC output with h264/h265/jpeg codecs), the private
+  `IVRCameraPassthroughInternal_001` source switch used by
+  [frame-passthrough-shortcuts](https://github.com/KominoVR/frame-passthrough-shortcuts)
+  (settings, not pixels), and `XRPCClient` in `libArcturusPerception.so` (no safe second
+  client found).
+- **`/dev/shm/eye-server.mmap`** (324,122 bytes, shared by `eyetracking` and
+  `driver_cv`, guarded by process-shared mutexes): only the first 4 KiB held data (gaze
+  and control, inferred); the rest was zero. Not an image path. Read once with
+  `read(2)`; locks never taken.
+- **Not tried**: `eyetracking --calib <seconds>` (saves PNGs but opens the cameras
+  itself, conflicting with the running service), `--logGazes` (gaze logs only; needs a
+  restart), the 32 MiB DSP buffer (small changing regions, undecoded), and
+  `GetEyeTrackedFoveationCenter` (foveation points, not a gaze ray).
 
-## Remaining technical limits
+## Open questions
 
-Verified deliverables: passive full-resolution NV12 Arcturus images and native 8-bit
-mono images from the four tracking cameras, and live head-relative gaze through the
-public OpenVR API. Unresolved: Arcturus sensor Bayer access, definitive anatomical
-ring association, producer-fenced coherent stereo capture, metadata clock/exposure
-decoding, gaze accuracy against ground truth, and non-disruptive eye-camera images.
-These require additional interface evidence, not another format guess or a
-disruptive restart hidden inside a capture tool.
+- Arcturus Bayer (pre-ISP) data while VR runs.
+- Left/right mapping of the outward-camera `a`/`b` blocks.
+- Frame metadata: `frametap` marker units, eye timestamp clock, remaining ring-header
+  fields.
+- Producer-fenced (guaranteed untorn) capture.
+- Gaze accuracy against known targets.
