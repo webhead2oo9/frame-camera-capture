@@ -1,8 +1,10 @@
-# Steam Frame camera access
+# Steam Frame camera and eye-gaze access
 
 Local investigation of this Linux ARM64 headset, with owner-authorized captures.
 Arcturus is the attached third-party color-camera module, as identified by the owner.
 This is an experimental, firmware-specific interface, not a Valve-supported API.
+Outward camera images: [`tools/frametap`](#working-method-passive-dma-buffer-capture).
+Live gaze: [`tools/eyegaze`](#working-method-public-openvr-gaze-toolseyegaze).
 
 ## Working method: passive DMA-buffer capture
 
@@ -42,6 +44,8 @@ Prerequisites:
   or persistent executable capability is changed. CAP_SYS_PTRACE alone would
   not necessarily grant debugfs access.
 - A C compiler, Linux UAPI headers, and make. FFmpeg is only needed for previews.
+  Plain `make` also builds `tools/eyegaze`, which needs the OpenVR SDK headers in
+  `../openvr`; use `make tools/frametap tools/unpack_raw10` without them.
 
 After discovery and descriptor duplication, the program drops supplementary
 groups and root UID/GID to the sudo caller before creating output. Captures are
@@ -49,10 +53,11 @@ groups and root UID/GID to the sudo caller before creating output. Captures are
 keeps root privileges and warns. Images and original traces can contain private
 room contents, screens, serials, and calibration data; do not publish them blindly.
 
-`captures/` and the compiled `tools/frametap` / `tools/unpack_raw10` binaries are
-Git-ignored. Capture links below refer to local investigation artifacts, not files
-distributed with the repository. Keep custom output paths under `captures/` to
-retain that protection; ignoring files does not remove already tracked content.
+`captures/` and the compiled `tools/frametap`, `tools/unpack_raw10`, and
+`tools/eyegaze` binaries are Git-ignored. Capture links below refer to local
+investigation artifacts, not files distributed with the repository. Keep custom
+output paths under `captures/` to retain that protection; ignoring files does not
+remove already tracked content.
 
 ### Output and decoding
 
@@ -299,35 +304,131 @@ Directly reopening another process's DMA-buf through `/proc/PID/fd/N` failed
 (ENXIO/EACCES). `pidfd_getfd` with authorized privilege succeeded instead; that is
 the mechanism used by `frametap`, not reading arbitrary process memory.
 
-## Eye tracking: recorded entry points, not yet captured
+## Eye tracking
 
-Eye-tracking access is separate from these six outward-facing cameras.
+Eye-tracking access is separate from the six outward-facing cameras.
 
-- Installed executable: `/opt/steamvr/tools/eyetracking/bin/linuxarm64/eyetracking`.
-  Historical logs in `~/.local/share/Steam/logs/eyetracking.txt` include
-  `CGazeEstimatorCdsp`, `Failed to grab cdsp input buffer`, and user-presence
-  start/stop messages. They establish a DSP-backed path, not a tested raw-eye export.
-- `/dev/shm/eye-server.mmap` exists. Its binary layout, synchronization, and ownership
-  protocol have not been decoded; do not guess offsets or write into it.
-- Local SDK: `../openvr/headers/openvr.h`, `IVRInput` methods
-  `GetEyeTrackingDataRelativeToNow` and `GetEyeTrackingDataForNextFrame` return
-  `VREyeTrackingData_t` for an eye-tracking action handle and tracking origin.
-  The struct has `bActive`, `bValid`, `bTracked`, `vGazeOrigin`, and `vGazeTarget`.
-  These are gaze results, not eye-camera pixel buffers. Action setup/binding and
-  validity must be exercised before claiming usable gaze data. SDK declarations
-  alone do not prove the installed runtime implements the same interface version.
-- Installed binary strings include legacy OVM6211/ADSP-style camera paths;
-  historical logs contain an `exp5v rail ... rework is required` shutdown warning.
-  Neither proves the current eye-tracking path is broken or that those legacy
-  device nodes are usable.
+### Working method: public OpenVR gaze (`tools/eyegaze`)
 
-No eye-camera frames or application gaze samples were captured in this work.
+```sh
+make tools/eyegaze
+./tools/eyegaze --seconds 20 --output captures/gaze/my-run.csv   # no sudo
+./tools/eyegaze --seconds 5 --interval-ms 20                      # CSV on stdout
+```
+
+Prerequisites: SteamVR running, headset worn and awake, the eye-tracking service
+running normally (`/opt/steamvr/tools/eyetracking/bin/linuxarm64/eyetracking`), the
+local SDK headers in `../openvr` (2.15.6, `IVRInput_011`), and a C++17 compiler.
+Run as the desktop user; the tool refuses root. The output CSV must not exist.
+Exit codes: 0 = usable gaze observed, 2 = connected but no usable gaze (e.g.
+standby/off-head), 1 = API, I/O, or argument error.
+
+The Makefile links against the **installed** runtime loader,
+`/opt/steamvr/bin/linuxarm64/libopenvr_api.so`, via rpath. The SDK tree's own ARM64
+loader failed with `Unable to read VR Path Registry from /data/work/openvrpaths.vrpath`.
+Override with `make OPENVR_SDK=... STEAMVR_LIBDIR=...`.
+
+How it works:
+
+- `VR_Init(VRApplication_Background)`; checks `Prop_SupportsXrEyeGazeInteraction_Bool`
+  on the HMD (reported `1` here).
+- Sets the action manifest [`tools/eyegaze_actions.json`](tools/eyegaze_actions.json):
+  action `/actions/gaze/in/eye_gaze`, type `eyetracking` in set `/actions/gaze`.
+  Valve's [Steam Frame input doc](https://partner.steamgames.com/doc/steamhardware/steamframe/input)
+  specifies the action type; it does not document the binding.
+- Default binding [`tools/eyegaze_bindings_frame_hmd.json`](tools/eyegaze_bindings_frame_hmd.json)
+  for controller type `frame_hmd`:
+  `"eyetracking": [{"output": "/actions/gaze/in/eye_gaze", "path": "/user/head/eyetracking"}]`.
+  The section name and required `path`/`output` fields come from vrserver/vrclient
+  validation strings (`"eyetracking" member must be an array`, `... missing path or
+  output`). The path was inferred from the driver component name `/eyetracking` and is
+  confirmed by the live data below. Without this file SteamVR logged `frame_hmd has no
+  configured binding. Input will not be available`, and every sample was inactive.
+  Both JSON files must stay beside the executable. A harmless `frame_controller has
+  no configured binding` error remains because the tool defines no controller actions.
+- Each poll calls `UpdateActionState`, `GetEyeTrackingDataRelativeToNow(standing, 0 s)`,
+  and `GetDeviceToAbsoluteTrackingPose` for the HMD. `ForNextFrame` is not used: it
+  depends on the compositor's `WaitGetPoses`, which a background tool must not call.
+
+CSV columns: `host_monotonic_ns, input_error, active, valid, tracked, usable,
+hmd_activity, head_pose_valid`, then standing-space `origin_*_m` and `target_*_m`,
+then head-frame unit direction `head_dir_x/y/z` and `head_yaw_deg`/`head_pitch_deg`.
+Head frame: +x right, +y up, −z forward; yaw positive right, pitch positive up.
+Ray fields are blank for unusable samples, never zero-filled. Head-frame fields are
+also blank when the HMD pose is not `Running_OK`.
+
+Interpretation limits:
+
+- `target` is a fixation point, not a unit direction. Ray length ranged 0.11–59.9 m in
+  one run. Use the direction `normalize(target − origin)` or the `head_*` columns.
+  **[INFERENCE]** Depth is a vergence estimate; it was not validated as a distance.
+- Polling every 10 ms returned a different value on 1,999 of 2,000 polls. That reflects
+  the API evaluating/predicting at call time **[INFERENCE]**, not a 100 Hz tracker.
+  `vrserver.txt` logs `Request eye tracking framerate: 90`, and HMD settings list
+  `eyeTrackingRateMin/Max` 15/90. The true estimator rate was not measured.
+- The straight-ahead baseline sat about 3–8° left and 8–17° down. Whether that is the
+  subject's natural gaze or a calibration offset was not determined; no ground-truth
+  targets were used. Accuracy in degrees is therefore unmeasured.
+- Each row pairs gaze and head pose from two separate API calls at nearly the same
+  time, not an atomically matched sample.
+
+The tool is an ordinary OpenVR input client: it does not touch the eye-tracking
+service, its shared memory, DSP buffers, or eye cameras, and it changes no settings
+or other applications' bindings.
+
+### Verification
+
+- Standby: support property `1`, binding loaded, all samples inactive, exit 2.
+- First worn run, 20 s at 10 ms: 2,000/2,000 samples active, valid, and tracked.
+  That version recorded standing-space rays only; head motion and eye motion were
+  indistinguishable, so it was superseded rather than retained.
+- Head-relative directed sweep, 25 s at 10 ms:
+  [`captures/gaze/head-relative-sweep.csv`](captures/gaze/head-relative-sweep.csv).
+  2,500/2,500 samples usable; gaze-origin spread under 6 mm on every axis (head still).
+  The owner was asked to look straight, left, right, up, down; half-second medians:
+
+  | Instruction | Time | Yaw | Pitch |
+  | --- | --- | ---: | ---: |
+  | Straight | 0–4 s | −3° to −8° | −8° to −17° |
+  | Left | 4.5–9 s | −31.5° | −9.5° |
+  | Right | 10.5–17.5 s | +31° | −2° |
+  | Up | 18–23.5 s | −0.5° | +28° |
+  | Down | 24.5 s (recording ended) | +6° | −37° |
+
+  Stable, distinct clusters in the instructed order confirm the binding path, sign
+  conventions, and that the data follows eye movement. VR processes kept running.
+
+### Other eye-tracking routes investigated, not used
+
+- `/dev/shm/eye-server.mmap` (320 KiB mapping): created by the eyetracking server
+  (`CEyeTrackingMmapServer`), mapped only by vrserver's `driver_cv.so`
+  (`CEyeTrackingMmapClient`). It uses robust process-shared mutexes and futex wake-ups
+  for server→client and client→server channels; layout, magic, and version were not
+  recoverable from strings. Taking those locks from a third process could stall the
+  tracker. **[INFERENCE]** Its size fits two 400×400 8-bit eye images plus a 4 KiB
+  header (`/persist/eyetracking.json` lists 400×400 eye-camera intrinsics); contents
+  were deliberately not read.
+- Eye-camera images: the eyetracking binary has a `--calib <seconds>` mode that saves
+  `left_N.png`/`right_N.png` and `meta.json` under `/tmp/etcalib_*`, but it opens the
+  cameras itself and would conflict with the running server. Not tested.
+- `--logGazes` (via the `eyeDataRecordToDisk` setting and `start_eyetracking.sh start
+  datacapture`) writes gaze-only logs; it requires a service restart. Not tested.
+- DSP-side DMA buffers in the eyetracking and vrserver processes use frame-ownership
+  semantics; an extra reader could take frames from the tracker. Not attempted.
+- `IVRSystem::GetEyeTrackedFoveationCenter` returns per-eye NDC points for foveated
+  rendering, not a gaze ray. Not exercised.
+- Historical logs mention `CGazeEstimatorCdsp` input-buffer misses, legacy
+  OVM6211/ADSP camera paths, and an `exp5v rail ... rework is required` shutdown
+  warning. None prevented the live gaze results above.
+
+No eye-camera frames were captured.
 
 ## Remaining technical limits
 
-Verified deliverable: passive full-resolution NV12 Arcturus images and native
-8-bit mono images from the four tracking cameras, with repeatable capture commands.
-Unresolved: Arcturus sensor Bayer access, definitive anatomical/ring association,
-producer-fenced coherent stereo capture, metadata clock/exposure decoding, and eye
-camera/gaze capture. These require additional interface evidence, not another
-format guess or a disruptive restart hidden inside the capture tool.
+Verified deliverables: passive full-resolution NV12 Arcturus images and native 8-bit
+mono images from the four tracking cameras, and live head-relative gaze through the
+public OpenVR API. Unresolved: Arcturus sensor Bayer access, definitive anatomical
+ring association, producer-fenced coherent stereo capture, metadata clock/exposure
+decoding, gaze accuracy against ground truth, and non-disruptive eye-camera images.
+These require additional interface evidence, not another format guess or a
+disruptive restart hidden inside a capture tool.

@@ -1,0 +1,25 @@
+{
+  "actions": [
+    {
+      "name": "/actions/gaze/in/eye_gaze",
+      "type": "eyetracking",
+      "requirement": "optional"
+    }
+  ],
+  "action_sets": [
+    { "name": "/actions/gaze", "usage": "single" }
+  ],
+  "default_bindings": [
+    {
+      "controller_type": "frame_hmd",
+      "binding_url": "eyegaze_bindings_frame_hmd.json"
+    }
+  ],
+  "localization": [
+    {
+      "language_tag": "en_US",
+      "/actions/gaze": "Gaze",
+      "/actions/gaze/in/eye_gaze": "Eye gaze"
+    }
+  ]
+}
